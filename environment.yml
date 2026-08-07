@@ -1,0 +1,44 @@
+# environment.yml — "deepdream" env, lives at the root of the Deep_Dream repo.
+#
+# Scope: the two Ubuntu 22.04 machines.
+#   * "monster" workstation — 4x GTX TITAN X (Maxwell, sm_52), driver 535.xx  <- primary
+#   * newer 22.04 laptop
+#   NOT the Ubuntu 18.04 System76: torch >= 2.7.0 wheels are manylinux_2_28
+#   (need glibc >= 2.28; 18.04 has 2.27). If that machine ever needs this env,
+#   drop one pin back: torch==2.6.0+cu118 / torchvision==0.21.0+cu118 (the last
+#   manylinux2014 CUDA build). The notebook code is identical under either pin.
+#
+# Why torch 2.7.1 + cu118, pinned hard:
+#   * 2.7.1 is the FINAL PyTorch release with CUDA 11.8 wheels, and the cu118
+#     builds are the last compiled with Maxwell support (arch list includes
+#     sm_50; sm_50 SASS runs on the sm_52 Titan X via same-major compatibility).
+#   * torch 2.8+ ships no cu118 wheels, and its cu12x wheels dropped Maxwell.
+#     => NEVER `pip install -U torch` in this env: it would remove GPU support
+#     for the Titan X cards entirely. This pin changes only when the GPUs do.
+#   * The wheels bundle their own CUDA 11.8 runtime + cuDNN as nvidia-*-cu11
+#     pip packages — no conda cudatoolkit here, no interaction with `fractal`.
+#   * Driver 535 satisfies CUDA 11.8 with lots of headroom.
+#   * Maxwell notes: eager fp32 only. torch.compile/Triton needs sm_70+, and
+#     fp16/tensor-core paths don't exist on these cards — fp32 IS the fast lane.
+#
+# Video: imageio-ffmpeg from pip = static ffmpeg with libx264. Proven writer
+#   settings: codec="libx264", pixelformat="yuv420p",
+#   output_params=["-crf","20","-preset","slow"].
+name: deepdream
+channels:
+  - conda-forge
+  - nodefaults
+dependencies:
+  - python=3.12
+  - numpy
+  - pillow
+  - imageio
+  - matplotlib
+  - jupyterlab
+  - ipykernel
+  - pip
+  - pip:
+      - imageio-ffmpeg
+      - --extra-index-url https://download.pytorch.org/whl/cu118
+      - torch==2.7.1+cu118
+      - torchvision==0.22.1+cu118
