@@ -3,6 +3,20 @@
 Read this first. This is a standalone project. It is deliberately independent
 of Fractal Studio (which is only one possible source of input frames).
 
+## Status (2026-08-07)
+
+* **Milestone 1 is DONE and verified on the workstation** ("monster"):
+  `deepdream_pytorch.ipynb` — a PyTorch port of the TF DeepDream tutorial
+  (simple dream, octaves, rolled tiled gradients), plus two forward-looking
+  extras: a **working weighted multi-target objective** (`TargetDream` /
+  `run_deep_dream_targets` — design commitment 2 has a reference
+  implementation) and `dream_zoom_video` (frame t seeded from dreamed frame
+  t-1 — the embryo of `coherence/`).
+* The notebook is the **reference implementation**. When building `engine/`,
+  lift and modularize from it rather than re-deriving.
+* The GPU question below is resolved (cards are **Maxwell sm_52**) and the
+  environment is settled and pinned — do not revisit the torch pin.
+
 ## What this is
 
 A general **video-to-video DeepDream filter**. Input: any video (or a folder
@@ -36,16 +50,29 @@ Design commitments (these are the point of the project, not extras):
 * Clean seam: the two projects meet only through a **folder of numbered PNG
   frames**. No shared code.
 
-## Hardware (shared with Fractal Studio owner)
+## Hardware & environment (settled 2026-07)
 
-* Laptop: GTX 1650 (Turing, sm_75), i7-9750H, Ubuntu 18.04.6. Good dev/test
-  GPU — sm_75 is supported by any recent PyTorch. Prototype here.
-* Workstation (render farm, not yet set up): 4x "Titan X", ~16 cores.
-  **Ambiguous GPU:** Titan X Maxwell (sm_52) vs Titan X Pascal (sm_61).
-  Recent PyTorch binaries may have dropped Maxwell. FIRST STEP on that box:
-  `nvidia-smi`, then check `torch.cuda.get_arch_list()` vs the card; if
-  Maxwell, pin an older torch (cu11x, ~1.13/2.0-era). Frames are
-  embarrassingly parallel → shard frame ranges across the 4 GPUs.
+* Primary: "monster" workstation — Ubuntu 22.04, 4x GTX TITAN X **Maxwell
+  (sm_52)**, 12 GB each, driver 535. Set up, verified, dreams rendered.
+* Secondary: the newer Ubuntu 22.04 laptop.
+* The Ubuntu 18.04 laptop (GTX 1650) is **out of scope** for this project:
+  torch >= 2.7 wheels require glibc >= 2.28, and conda-forge's baseline is
+  headed there too. (Documented fallback if it's ever needed:
+  `torch==2.6.0+cu118` / `torchvision==0.21.0+cu118` — same code runs.)
+* Env: `conda env create -f environment.yml` → env **`deepdream`**, Jupyter
+  kernel registered as `deepdream`. Run project code inside that env
+  (`conda activate deepdream`, or `conda run -n deepdream python ...`).
+* **Pinned hard: `torch==2.7.1+cu118` / `torchvision==0.22.1+cu118`. NEVER
+  upgrade torch in this env.** 2.7.1 is the final release with cu118 wheels
+  and the last whose binaries ship Maxwell (sm_50) kernels; 2.8+ removes
+  both. This pin changes only if the GPUs do. Full rationale lives in the
+  comments of `environment.yml`.
+* Maxwell constraints: **eager fp32 only** — no `torch.compile` (Triton needs
+  sm_70+), no fp16/tensor cores. fp32 *is* the fast lane on these cards.
+* Multi-GPU: frames are embarrassingly parallel → one worker process per card
+  via `CUDA_VISIBLE_DEVICES`; no DDP/NCCL needed. **Caveat:** frame-seeded
+  coherence makes frames within a chain sequential — shard by scene/chunk
+  (each coherent run stays on one GPU), not by interleaved frame index.
 
 ## Proposed architecture
 
@@ -55,7 +82,7 @@ Design commitments (these are the point of the project, not extras):
                      - model loader (pretrained torchvision nets) + layer hooks
                      - objective = weighted sum over a target list of
                        (layer, channel, weight); .backward() to the image
-                     - octave loop (scale ~1.4, re-add detail), jitter roll,
+                     - octave loop (scale 1.3, re-add detail), jitter roll,
                        normalized-gradient ascent step, clamp
     schedule/      time-varying parameter envelopes: map frame index/time ->
                    {targets+weights, strength, layer, octaves...}. Keyframes
@@ -70,6 +97,23 @@ Design commitments (these are the point of the project, not extras):
                    plain blend, or optical flow for arbitrary footage.
     cli.py         run the whole pipeline from a config file / args.
 
+Conventions already established by the notebook — keep them:
+* User-facing layer names are Keras-style `mixed0..mixed10`, mapped to
+  torchvision InceptionV3 modules (`Mixed_5b..Mixed_7c`) via the
+  `KERAS_TO_TV` dict; feature taps via
+  `torchvision.models.feature_extraction.create_feature_extractor`, one
+  extractor per objective (build it from exactly the layers the targets use).
+* `base_model.transform_input = False` + preprocessing `x/127.5 - 1`: inside
+  the machinery images are float32 **HWC in [-1, 1]** on-device; at the human
+  edges they are plain numpy uint8. `preprocess()` / `deprocess()` are the
+  doors. (The AttributeError you get from mixing these up is the convention
+  announcing itself.)
+* Octaves: scale 1.30 over `range(-2, 3)`. Tiled gradients with random roll,
+  `tile_size=512`.
+* Video writing: imageio + pip imageio-ffmpeg (static ffmpeg with libx264):
+  `codec="libx264", pixelformat="yuv420p",
+  output_params=["-crf","20","-preset","slow"]`; keep frame dimensions even.
+
 ## Feature discovery
 
 Batch-dream noise/gray images per channel of a layer into a contact sheet;
@@ -78,7 +122,21 @@ many flora/texture detectors in mid layers. Save chosen targets as named
 presets ("flowers", "eyes", "swirls") that the schedule can reference and
 blend.
 
+Notes for the implementation (milestone 2, next up):
+* Channel counts at the current taps: `mixed7` → 768, `mixed9` → 2048.
+* Dream many channels per GPU pass by **batching**: N low-res seeds
+  (~256 px; gray/noise or a downscaled photo) with a per-batch-item
+  single-channel loss (sum of `acts[layer][i, channel_i].mean()` over i) —
+  gradients stay independent per item.
+* Cheap pre-filter first: one forward pass on a seed image, rank channels by
+  mean activation, contact-sheet the shortlist.
+
 ## Model choice (open question for rafa)
+
+Milestone 1 runs torchvision **InceptionV3** (`IMAGENET1K_V1`,
+`transform_input=False`) — the working default. The alternatives below stay
+open for aesthetic comparison; the engine's model loader should make swapping
+backbones easy.
 
 * GoogLeNet / Inception-v1 — the classic DeepDream look; ornate, intricate.
   Mid layers like inception4c/4d.
@@ -88,12 +146,16 @@ blend.
 
 ## Milestones
 
-1. Single-image dream on the laptop GPU (one channel), verify the look.
-2. Weighted multi-target objective; contact-sheet channel browser.
-3. Coherent 5-second dreamed clip (frame-to-frame seeding), arbitrary input.
+1. Single-image dream, verify the look — **DONE 2026-07**, verified on the
+   monster (scope moved off the old laptop): `deepdream_pytorch.ipynb`.
+2. Weighted multi-target objective (**done in-notebook**); contact-sheet
+   channel browser — **next up**.
+3. Coherent 5-second dreamed clip (frame-to-frame seeding), arbitrary input —
+   embryo exists as `dream_zoom_video` in the notebook.
 4. Time-varying schedule (targets/strength morphing across the clip).
 5. Optional zoom-warp coherence using Fractal Studio's per-frame zoom sidecar.
-6. Multi-GPU frame sharding on the workstation.
+6. Multi-GPU frame sharding on the workstation — see the coherence×sharding
+   caveat under Hardware.
 
 ## Open design questions for rafa
 
