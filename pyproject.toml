@@ -1,0 +1,14 @@
+# Test/tool configuration only — this repo is run in place from its root
+# (`python cli.py ...` inside the `deepdream` conda env), not pip-installed.
+# Dependencies live in environment.yml, where the torch pin's rationale is.
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "slow: needs the pretrained backbone (and really wants a GPU)",
+]
+filterwarnings = [
+    # torchvision notes that eval-mode graph nodes are a subsequence of
+    # train-mode ones. We only ever tap in eval mode; that is the point.
+    "ignore:.*nodes obtained by tracing.*:UserWarning",
+]

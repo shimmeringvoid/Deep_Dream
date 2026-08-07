@@ -36,6 +36,7 @@ dependencies:
   - matplotlib
   - jupyterlab
   - ipykernel
+  - pytest
   - pip
   - pip:
       - imageio-ffmpeg

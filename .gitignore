@@ -7,3 +7,10 @@ frames/
 out/
 *.pt
 *.pth
+
+# Local Claude Code settings (per-machine permissions), not project config.
+.claude/settings.local.json
+.claude/*.tmp.*
+
+# Test/venv scratch
+.pytest_cache/

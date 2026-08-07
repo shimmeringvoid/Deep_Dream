@@ -1,0 +1,32 @@
+{
+  "name": "scales",
+  "backbone": "inception_v3",
+  "notes": "picked by eye off out/browse/inception_v3-mixed7 sheets, 2026-08-07 (browse defaults: 256px, 96 steps, octaves -2..0, grad-blur 1.0, batch 16). Reptile/roof texture; strong on flat regions.",
+  "targets": [
+    {
+      "layer": "mixed7",
+      "channel": 55,
+      "weight": 1.0
+    },
+    {
+      "layer": "mixed7",
+      "channel": 43,
+      "weight": 0.8
+    },
+    {
+      "layer": "mixed7",
+      "channel": 610,
+      "weight": 0.7
+    },
+    {
+      "layer": "mixed7",
+      "channel": 611,
+      "weight": 0.6
+    },
+    {
+      "layer": "mixed7",
+      "channel": 10,
+      "weight": 0.5
+    }
+  ]
+}
