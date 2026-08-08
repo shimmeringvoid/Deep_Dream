@@ -6,6 +6,7 @@
 testpaths = ["tests"]
 markers = [
     "slow: needs the pretrained backbone (and really wants a GPU)",
+    "multigpu: needs more than one GPU (browse sharding)",
 ]
 filterwarnings = [
     # torchvision notes that eval-mode graph nodes are a subsequence of

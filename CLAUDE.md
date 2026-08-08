@@ -3,7 +3,7 @@
 Read this first. This is a standalone project. It is deliberately independent
 of Fractal Studio (which is only one possible source of input frames).
 
-## Status (2026-08-07)
+## Status (2026-08-08)
 
 * **Milestone 1 is DONE and verified on the workstation** ("monster"):
   `deepdream_pytorch.ipynb` — a PyTorch port of the TF DeepDream tutorial
@@ -16,12 +16,18 @@ of Fractal Studio (which is only one possible source of input frames).
   and the contact-sheet channel browser works — all 768 `mixed7` channels
   sheeted and eye-pickable, three presets picked from them. See
   "Architecture", "Feature discovery" and "Decisions settled 2026-08-07" below.
+* **The browser now shards across all four GPUs** (2026-08-08): `--gpus 4`,
+  ~3.3x, tiles **bit-identical** to the one-card run because the shards are cut
+  on `batch_size` boundaries. With it, `mixed9` (all 2048 channels) has been
+  browsed in 15.8 min. See "Multi-GPU browsing" and "Decisions settled
+  2026-08-08". Nothing has been eye-picked out of those sheets yet.
 
       conda activate deepdream
-      python cli.py layers                  # taps and channel counts
-      python cli.py browse --layer mixed7   # contact sheets -> out/browse/
+      python cli.py layers                       # taps and channel counts
+      python cli.py browse --layer mixed7        # contact sheets -> out/browse/
+      python cli.py browse --layer mixed9 --gpus 4   # 2048 channels, four cards
       python cli.py dream photo.jpg --preset flowers
-      python -m pytest tests -q             # 30 tests, ~6 s
+      python -m pytest tests -q                  # 46 tests, ~11 s
 * The notebook is still the **reference implementation** for the *look*, and
   the place to play interactively. `engine/` is the same machinery, importable;
   `cli.py dream ... --targets mixed7,mixed9` reproduces the notebook's
@@ -86,6 +92,12 @@ Design commitments (these are the point of the project, not extras):
   via `CUDA_VISIBLE_DEVICES`; no DDP/NCCL needed. **Caveat:** frame-seeded
   coherence makes frames within a chain sequential — shard by scene/chunk
   (each coherent run stays on one GPU), not by interleaved frame index.
+  `engine/shard.py` already does exactly this for the channel browser
+  (`--gpus 4`, ~3.3x); milestone 6 should copy its process/env/merge shape.
+* GPU 0 also hosts an unrelated long-lived Jupyter kernel (`inception` env,
+  ~4.7 GB, running since late July). Harmless at browse batch sizes (~1.7 GB
+  per worker) but it does make GPU 0 the slow shard — check before blaming the
+  code, and it is rafa's to kill, not Claude's.
 
 ## Architecture
 
@@ -100,9 +112,13 @@ Built (milestone 2):
                          the octave loop from the notebook.
     engine/discover.py   milestone 2: batched per-channel dreaming, the
                          gradient-blur regularizer, contact sheets, ranking.
+    engine/shard.py      one browse worker process per GPU: batch-aligned
+                         channel spans, CUDA_VISIBLE_DEVICES, merge. Also the
+                         worker entry point (`python -m engine.shard job.json`).
     engine/presets.py    named target lists as JSON in presets/.
     cli.py               subcommands: layers | browse | dream | presets.
-    tests/test_engine.py 30 tests; the slow ones need a GPU + weights.
+    tests/test_engine.py 46 tests; the slow ones need a GPU + weights, and one
+                         is marked `multigpu`.
 
 Still to build:
 
@@ -153,6 +169,7 @@ eye-pick "flower"-like (or whatever) channels. Save chosen targets as named
 presets that the schedule can reference and blend.
 
     python cli.py browse --layer mixed7                  # all 768, ~19 min
+    python cli.py browse --layer mixed9 --gpus 4         # all 2048, ~16 min
     python cli.py browse --layer mixed9 --top 128        # shortlist first
     python cli.py browse --layer mixed7 --channels 0-63 --steps 200
 
@@ -196,6 +213,92 @@ one forward pass and keeps the K channels *that image* already excites. Use it
 when hunting for channels that will do something to particular footage; for
 "what is this layer made of", just browse all of them.
 
+### Multi-GPU browsing — BUILT (`engine/shard.py`, `--gpus`) 2026-08-08
+
+    python cli.py browse --layer mixed9 --gpus 4     # 2048 channels, ~3.3x
+    python cli.py browse --layer mixed7 --gpus 0,2,3 # leave a card alone
+    python cli.py browse --layer mixed7              # unchanged: one process
+
+`--gpus` takes a count (`4`), an explicit list (`0,2,3`), or `all`; omitted
+means one process on `--device`, exactly as before. To pin a single-process
+browse to one card, that is still `--device cuda:3` — a bare `--gpus 3` means
+*three cards*, not card 3.
+
+**The alignment rule is the whole design.** A tile is only reproducible at the
+batch size it was dreamed in (cuDNN picks kernels by batch shape; see the
+determinism trap above), and `dream_channels` walks its list in chunks of
+`batch_size`. So shards are **contiguous spans cut on `batch_size`
+boundaries**, and every worker runs the *same* `batch_size`. Then each chunk
+holds the same channels, in the same order, at the same shape as it would have
+unsharded — and the sheets are bit-identical to the one-card run, so
+`index.json`'s "re-run at this batch size to regenerate this tile" promise
+survives sharding untouched. The obvious `channels[gpu::4]` round-robin would
+repack every chunk with different neighbours and silently invalidate the whole
+sheet; `plan_shards()` is the function that refuses to do that.
+
+Consequence worth knowing: with fewer batch-aligned blocks than cards, spare
+cards get nothing rather than the split being nudged off a boundary — 32
+channels at batch 16 is two blocks, so two GPUs idle and the CLI says so.
+Shrink `--batch` to spread work wider.
+
+Mechanics: one worker process per card under `CUDA_VISIBLE_DEVICES=<n>` (each
+sees its card as `cuda:0`), tiles handed back as `.npy` through
+`out/.shards/`, parent concatenates in channel order and writes one sheet set
+and one `index.json` — which now also records `settings.gpus`. The parent
+holds **no CUDA context**: with `--gpus` it loads the backbone on the CPU,
+since all it needs is the channel count and (for `--top`) the ranking pass.
+One caveat from that: with `--gpus`, `--top`'s ranking is computed on the CPU,
+so near-ties can order differently than the GPU would have. It is a shortlist
+heuristic and the scores go into `index.json`, so this is noted, not a problem.
+If any shard dies the rest are terminated immediately rather than grinding out
+a quarter-browse that gets thrown away.
+
+Verified 2026-08-08, at full browse defaults, tiles compared byte-for-byte:
+
+* 32 channels (`mixed7` 0-31), `--batch 8`, 4 GPUs vs 1 GPU — all 32 tiles and
+  the sheet PNG **identical**. 19.1 s vs 63.0 s (**3.3x**).
+* 40 channels (`mixed7` 100-139), `--batch 16`, 4 GPUs vs 1 — identical too.
+  This is the ragged case: 40 is 2.5 blocks, so three GPUs get 16/16/8 and the
+  partial chunk stays at the end of the list where the unsharded run puts it.
+* In the suite: `test_plan_shards*` (pure logic, instant) and
+  `test_sharded_browse_matches_single_gpu` (`-m multigpu`, a cheap 2-GPU
+  version of the check above).
+
+Scaling is sublinear-ish because the cards are not identical in load — GPU 0
+also hosts an unrelated long-lived Jupyter kernel (~4.7 GB), which is worth
+remembering before blaming the sharding for a slow shard: on the `mixed9` run
+the three clean cards finished 512 channels in 14.3 min and GPU 0 took
+15.7 min. Memory is not the constraint: a worker at batch 16 / 256 px sits at
+~1.7 GB, so batch could go a lot higher if wall-clock ever mattered more than
+matching an existing sheet's batch size.
+
+### `mixed9` browsed — all 2048 channels (2026-08-08)
+
+    python cli.py browse --layer mixed9 --gpus 4     # 948.6 s = 15.8 min
+
+32 sheets in `out/browse/inception_v3-mixed9/`, at browse defaults (256 px, 96
+steps, octaves -2..0, batch 16, grad-blur 1.0, deterministic). Aggregate
+2.18 ch/s against ~0.6 ch/s on one card — the four-card run is the difference
+between "after lunch" and "while you make coffee", which is what makes
+browsing a 2048-channel layer a normal thing to do rather than an expedition.
+
+Two things to know before picking off these sheets:
+
+* **`mixed9` tiles read much busier than `mixed7`'s.** Deeper layer, larger
+  receptive field, and at 256 px the features are cramped: lots of ornate
+  high-frequency filigree, fewer of the clean single-motif tiles that made
+  `mixed7` easy to eye-pick. If picking proves hard, the knobs to try first
+  are a bigger `--size` and a stronger `--grad-blur` (2.0), not more steps.
+* **~9% of the layer is effectively blank at these settings** — 191 of 2048
+  tiles come out near-flat gray (tile std < 15 against a median of 64), e.g.
+  1028, 1037, 1040, 1043, 1049, 1053, 1070. They are spread across the whole
+  layer, not clustered. These are channels a gray seed simply does not excite;
+  `--top K --rank-image <your footage>` is the right way to skip them rather
+  than paying to dream them.
+
+Nothing has been eye-picked into a preset from `mixed9` yet — that is rafa's
+call, and the eyes hunt (below) is the obvious first errand.
+
 ### Presets picked from that first sheet (2026-08-07)
 
 All `mixed7` / InceptionV3, eye-picked off `out/browse/inception_v3-mixed7`,
@@ -212,10 +315,11 @@ verified by rendering each on the labrador (`cli.py dream ... --preset X`):
 
 **Not found: eyes.** `mixed7` has eye-*ish* channels (274, 309) but nothing
 convincing. Expected — `mixed7` is a texture/part layer; whole-object features
-like eyes and faces live deeper. Browse `mixed9` (2048 channels, ~50 min at
-defaults) or `mixed10` when an eyes preset is wanted.
+like eyes and faces live deeper. `mixed9`'s 2048 sheets now exist (2026-08-08,
+15.8 min on four cards) and are where to hunt; `mixed10` is the next stop.
 
-Layers other than `mixed7` have not been browsed yet.
+Browsed so far: `mixed7` (768) and `mixed9` (2048), both InceptionV3, both at
+browse defaults. No other layer or backbone has been sheeted.
 
 ## Model choice (still open for rafa — but now a flag away)
 
@@ -262,7 +366,10 @@ which backbone it was picked on, and `cli.py dream` warns on a mismatch.
    preset format is ready to be referenced by name from a schedule.
 5. Optional zoom-warp coherence using Fractal Studio's per-frame zoom sidecar.
 6. Multi-GPU frame sharding on the workstation — see the coherence×sharding
-   caveat under Hardware.
+   caveat under Hardware. **Half-done early**: the channel browser already
+   shards across all four cards (`engine/shard.py`, 2026-08-08); frames want
+   the same process/env/merge shape with a scene-chunk planner instead of an
+   aligned-span one.
 
 ## Decisions settled 2026-08-07 (the engine/ + browser session)
 
@@ -293,6 +400,27 @@ These are commitments now; change them deliberately, not by drift.
   the only thing that would notice.
 * **Not adopted:** no `torch.compile` (Maxwell), no fp16, no pip-installable
   package (`python cli.py` from the repo root, inside the `deepdream` env).
+
+## Decisions settled 2026-08-08 (the multi-GPU browse session)
+
+* **Shards are batch-aligned contiguous spans, never round-robin.** The full
+  reasoning is under "Multi-GPU browsing"; the one-line version is that a tile
+  is reproducible only at its own batch size, so a cut anywhere but a
+  `batch_size` boundary would repack the chunks and quietly break every sheet.
+  `plan_shards()` owns this rule and `test_plan_shards_is_a_batch_aligned_
+  partition` guards it.
+* **`batch_size` is uniform across shards**, deliberately, for the same
+  reason. `index.json` records one `batch_size` because there *is* one.
+* **Processes, not threads or DDP.** `CUDA_VISIBLE_DEVICES` per worker,
+  `.npy` through a scratch dir, merge in the parent. Same shape milestone 6
+  wants for frame sharding, so `engine/shard.py` is the pattern to copy (the
+  planner is not, though: frames in a coherent chain are sequential, so that
+  split is by scene/chunk, not by aligned index spans).
+* **The parent stays off the GPUs** when sharding — CPU backbone for metadata
+  only. Cheap, and it keeps a card's worth of memory out of the picture.
+* **Sheet writing is separate from dreaming** (`discover.write_sheets`), so
+  the sharded and single-GPU paths converge on one implementation of "sheets +
+  index" rather than growing two.
 
 ## Open design questions for rafa
 

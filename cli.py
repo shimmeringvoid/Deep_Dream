@@ -5,6 +5,7 @@
 
     python cli.py layers                                   # what can I tap?
     python cli.py browse --layer mixed7                    # contact-sheet all 768
+    python cli.py browse --layer mixed9 --gpus 4           # all 2048, four cards
     python cli.py browse --layer mixed9 --top 128          # shortlist first
     python cli.py dream photo.jpg --targets mixed7:10:1,mixed9:4:-0.5
     python cli.py dream photo.jpg --preset flowers
@@ -22,7 +23,7 @@ import argparse
 import sys
 import time
 
-from engine import discover, image as imageio_, presets as presets_mod
+from engine import discover, image as imageio_, presets as presets_mod, shard
 from engine.dream import OCTAVES, dream
 from engine.model import DEFAULT_BACKBONE, available_backbones, get_device, load_backbone
 from engine.objective import Objective, parse_targets
@@ -46,7 +47,10 @@ def cmd_layers(args):
 
 
 def cmd_browse(args):
-    backbone = load_backbone(args.backbone, args.device)
+    gpus = shard.parse_gpu_spec(args.gpus)
+    # When the workers own the cards, the parent has no business holding a CUDA
+    # context: it only needs the channel count and (for --top) one ranking pass.
+    backbone = load_backbone(args.backbone, "cpu" if gpus else args.device)
     n_ch = backbone.channels(args.layer)
     channels = discover.parse_channel_spec(args.channels, n_ch)
 
@@ -61,6 +65,18 @@ def cmd_browse(args):
         f"at {args.size}px x {args.steps} steps x {len(args.octaves)} octaves, "
         f"batch {args.batch}"
     )
+    if gpus:
+        spans = shard.plan_shards(len(channels), len(gpus), args.batch)
+        if len(spans) < len(gpus):
+            print(
+                f"note: {len(channels)} channels at batch {args.batch} is only "
+                f"{len(spans)} batch-aligned block(s), so {len(spans)} of "
+                f"{len(gpus)} GPU(s) get work. Shrink --batch to spread it "
+                f"wider (tiles are only reproducible at their own batch size, "
+                f"so the shards cannot be cut anywhere else).",
+                file=sys.stderr,
+            )
+        print(f"sharding across GPU(s) {', '.join(str(g) for g in gpus[: len(spans)])}:")
     t0 = time.time()
     index = discover.browse_layer(
         backbone,
@@ -82,7 +98,8 @@ def cmd_browse(args):
         grad_blur=args.grad_blur,
         deterministic=not args.nondeterministic,
         save_tiles=args.save_tiles,
-        progress=_progress,
+        gpus=gpus,
+        progress=None if gpus else _progress,
     )
     print(f"\n{len(index['pages'])} sheet(s) in {time.time() - t0:.1f}s:")
     for p in index["pages"]:
@@ -166,6 +183,11 @@ def build_parser():
     p.add_argument("--step-size", type=float, default=0.05)
     p.add_argument("--seed", default="gray", help="gray | noise | path/to/image")
     p.add_argument("--batch", type=int, default=16, help="channels per GPU pass")
+    p.add_argument("--gpus", default=None,
+                   help="fan out to one worker process per GPU: a count (4), an "
+                        "explicit list (0,2,3), or 'all'. Omitted = one process "
+                        "on --device. Shards are cut on --batch boundaries, so "
+                        "the sheets come out identical to the single-GPU run")
     p.add_argument("--octaves", type=_octave_range, default=[-2, -1, 0],
                    help="lo:hi inclusive (default -2:0)")
     p.add_argument("--jitter", type=int, default=8)

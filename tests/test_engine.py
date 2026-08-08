@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 import torch
 
-from engine import discover, image, presets
+from engine import discover, image, presets, shard
 from engine.model import load_backbone
 from engine.objective import Objective, Target, parse_target, parse_targets
 
@@ -253,3 +253,73 @@ def test_rank_channels_covers_the_layer(backbone):
     assert {c for c, _ in ranked} == set(range(768))
     scores = [s for _, s in ranked]
     assert scores == sorted(scores, reverse=True)
+
+
+# ---------------------------------------------------------------------------
+# Multi-GPU shard planning
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "n,gpus,batch,expected",
+    [
+        # The even case: 2048 channels, batch 16, four cards.
+        (2048, 4, 16, [(0, 512), (512, 1024), (1024, 1536), (1536, 2048)]),
+        # A ragged tail stays at the very end, where the unsharded run puts it.
+        (100, 3, 16, [(0, 48), (48, 80), (80, 100)]),
+        # Fewer blocks than cards: the spare cards get nothing, rather than the
+        # shards being cut off a batch boundary to keep everyone busy.
+        (32, 4, 16, [(0, 16), (16, 32)]),
+        (32, 4, 8, [(0, 8), (8, 16), (16, 24), (24, 32)]),
+        (1, 4, 16, [(0, 1)]),
+        (0, 4, 16, []),
+    ],
+)
+def test_plan_shards(n, gpus, batch, expected):
+    assert shard.plan_shards(n, gpus, batch) == expected
+
+
+@pytest.mark.parametrize("n,gpus,batch", [(2048, 4, 16), (768, 3, 16), (100, 4, 7)])
+def test_plan_shards_is_a_batch_aligned_partition(n, gpus, batch):
+    """Every boundary on a batch multiple, no gaps, no overlaps, nothing lost.
+
+    That alignment is the whole reason the sharded sheets match the one-card
+    sheets: it guarantees each shard chunks the channel list exactly where the
+    unsharded run would have.
+    """
+    spans = shard.plan_shards(n, gpus, batch)
+    assert [c for a, b in spans for c in range(a, b)] == list(range(n))
+    assert all(start % batch == 0 for start, _ in spans)
+    assert all(stop % batch == 0 for _, stop in spans[:-1])
+
+
+@pytest.mark.parametrize(
+    "spec,expected",
+    [("4", [0, 1, 2, 3]), ("0,2,3", [0, 2, 3]), ("1-3", [1, 2, 3]),
+     (None, []), ("0", []), ("", [])],
+)
+def test_parse_gpu_spec(spec, expected):
+    assert shard.parse_gpu_spec(spec) == expected
+
+
+@pytest.mark.slow
+@pytest.mark.multigpu
+def test_sharded_browse_matches_single_gpu(tmp_path):
+    """Two cards, split down the middle, must give bit-identical tiles.
+
+    The full-size version of this check (32 channels over 4 GPUs at browse
+    defaults) is in CLAUDE.md; this is the cheap one that can live in the
+    suite.
+    """
+    if torch.cuda.device_count() < 2:
+        pytest.skip("needs at least 2 GPUs")
+    chans = list(range(8))
+    kw = dict(size=128, steps=6, batch_size=4, octaves=(0,))
+    sharded, used = shard.dream_channels_sharded(
+        "inception_v3", "mixed7", chans, [0, 1], work_dir=tmp_path, **kw
+    )
+    single = discover.dream_channels(
+        load_backbone("inception_v3", "cuda:0"), "mixed7", chans, **kw
+    )
+    assert used == [0, 1]
+    assert np.array_equal(sharded, single)

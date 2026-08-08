@@ -357,6 +357,76 @@ def contact_sheet(
     return sheet
 
 
+def browse_dir(out_dir, backbone_name: str, layer: str) -> pathlib.Path:
+    """Where a browse of `backbone/layer` lands. One place, so shards agree."""
+    return pathlib.Path(out_dir) / f"{backbone_name}-{layer}"
+
+
+def write_sheets(
+    out_dir,
+    backbone_name: str,
+    layer: str,
+    n_ch: int,
+    channels,
+    tiles,
+    settings: dict,
+    *,
+    save_tiles: bool = False,
+    ranking_top=None,
+) -> dict:
+    """Lay dreamed tiles out as sheets and write `index.json` beside them.
+
+    Split out from `browse_layer` because the multi-GPU path (`engine/shard.py`)
+    dreams the tiles in worker processes and then needs exactly this — one sheet
+    set and one index for the merged result, indistinguishable from a run on a
+    single card.
+    """
+    out_dir = pathlib.Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    channels = [int(c) for c in channels]
+    cols, per_page, tile_px = settings["cols"], settings["per_page"], settings["tile_px"]
+
+    if save_tiles:
+        tile_dir = out_dir / "tiles"
+        tile_dir.mkdir(exist_ok=True)
+        for ch, tile in zip(channels, tiles):
+            PIL.Image.fromarray(tile).save(tile_dir / f"ch{ch:04d}.png")
+
+    pages, entries = [], []
+    for page, start in enumerate(range(0, len(channels), per_page)):
+        chunk = channels[start : start + per_page]
+        path = out_dir / f"sheet_{page:03d}.png"
+        contact_sheet(
+            tiles[start : start + len(chunk)],
+            labels=chunk,
+            cols=cols,
+            tile_px=tile_px,
+            title=(
+                f"{backbone_name} / {layer} — channels {chunk[0]}..{chunk[-1]} "
+                f"(page {page + 1} of {-(-len(channels) // per_page)}, "
+                f"{n_ch} channels total)"
+            ),
+        ).save(path)
+        pages.append(str(path))
+        entries += [
+            {"channel": ch, "page": page, "slot": i} for i, ch in enumerate(chunk)
+        ]
+
+    index = {
+        "backbone": backbone_name,
+        "layer": layer,
+        "layer_channels": n_ch,
+        "browsed": len(channels),
+        "settings": settings,
+        "pages": pages,
+        "channels": entries,
+    }
+    if ranking_top is not None:
+        index["ranking_top"] = [{"channel": c, "score": s} for c, s in ranking_top]
+    (out_dir / "index.json").write_text(json.dumps(index, indent=2) + "\n")
+    return index
+
+
 def browse_layer(
     backbone: Backbone,
     layer: str,
@@ -378,6 +448,7 @@ def browse_layer(
     grad_blur: float = 1.0,
     deterministic: bool = True,
     save_tiles: bool = False,
+    gpus=None,
     progress=None,
 ) -> dict:
     """Dream a layer's channels and write contact sheets + an index.
@@ -387,6 +458,13 @@ def browse_layer(
       * `index.json` — channel order, page/slot of each tile, and the settings
         used, so a pick can be traced back and a run reproduced
       * `tiles/ch####.png` — full-size individual tiles (`save_tiles=True`)
+
+    With `gpus=[0, 1, 2, 3]` the dreaming fans out to one worker process per
+    card (`engine/shard.py`) and the sheets come out identical to the one-card
+    run — the shards are cut on `batch_size` boundaries precisely so that
+    holds. `backbone` is then only consulted for metadata (channel count and
+    the `--top` ranking), so pass a CPU-resident one and leave the cards to the
+    workers.
     """
     n_ch = backbone.channels(layer)
     if channels is None:
@@ -399,13 +477,10 @@ def browse_layer(
         keep = {c for c, _ in ranking[:top]}
         channels = [c for c in channels if c in keep]
 
-    out_dir = pathlib.Path(out_dir) / f"{backbone.name}-{layer}"
+    out_dir = browse_dir(out_dir, backbone.name, layer)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    tiles = dream_channels(
-        backbone,
-        layer,
-        channels,
+    dream_kwargs = dict(
         size=size,
         steps=steps,
         step_size=step_size,
@@ -417,61 +492,43 @@ def browse_layer(
         deterministic=deterministic,
         progress=progress,
     )
+    if gpus:
+        from .shard import dream_channels_sharded
 
-    if save_tiles:
-        tile_dir = out_dir / "tiles"
-        tile_dir.mkdir(exist_ok=True)
-        for ch, tile in zip(channels, tiles):
-            PIL.Image.fromarray(tile).save(tile_dir / f"ch{ch:04d}.png")
+        tiles, gpus = dream_channels_sharded(
+            backbone.name, layer, channels, gpus, **dream_kwargs
+        )
+    else:
+        tiles = dream_channels(backbone, layer, channels, **dream_kwargs)
 
-    pages, entries = [], []
-    for page, start in enumerate(range(0, len(channels), per_page)):
-        chunk = channels[start : start + per_page]
-        path = out_dir / f"sheet_{page:03d}.png"
-        contact_sheet(
-            tiles[start : start + len(chunk)],
-            labels=chunk,
-            cols=cols,
-            tile_px=tile_px,
-            title=(
-                f"{backbone.name} / {layer} — channels {chunk[0]}..{chunk[-1]} "
-                f"(page {page + 1} of {-(-len(channels) // per_page)}, "
-                f"{n_ch} channels total)"
-            ),
-        ).save(path)
-        pages.append(str(path))
-        entries += [
-            {"channel": ch, "page": page, "slot": i} for i, ch in enumerate(chunk)
-        ]
-
-    index = {
-        "backbone": backbone.name,
-        "layer": layer,
-        "layer_channels": n_ch,
-        "browsed": len(channels),
-        "settings": {
-            "size": size,
-            "steps": steps,
-            "step_size": step_size,
-            "seed": seed if isinstance(seed, str) else "image",
-            "octaves": list(octaves),
-            "jitter": jitter,
-            "grad_blur": grad_blur,
-            "deterministic": deterministic,
-            "batch_size": batch_size,
-            "cols": cols,
-            "per_page": per_page,
-            "tile_px": tile_px,
-        },
-        "pages": pages,
-        "channels": entries,
+    settings = {
+        "size": size,
+        "steps": steps,
+        "step_size": step_size,
+        "seed": seed if isinstance(seed, str) else "image",
+        "octaves": list(octaves),
+        "jitter": jitter,
+        "grad_blur": grad_blur,
+        "deterministic": deterministic,
+        # Uniform across shards by construction: a tile is only reproducible at
+        # the batch size it was dreamed in, so the shards share one.
+        "batch_size": batch_size,
+        "gpus": list(gpus) if gpus else None,
+        "cols": cols,
+        "per_page": per_page,
+        "tile_px": tile_px,
     }
-    if ranking is not None:
-        index["ranking_top"] = [
-            {"channel": c, "score": s} for c, s in ranking[: top or 0]
-        ]
-    (out_dir / "index.json").write_text(json.dumps(index, indent=2) + "\n")
-    return index
+    return write_sheets(
+        out_dir,
+        backbone.name,
+        layer,
+        n_ch,
+        channels,
+        tiles,
+        settings,
+        save_tiles=save_tiles,
+        ranking_top=(None if ranking is None else ranking[: top or 0]),
+    )
 
 
 def parse_channel_spec(spec: str, n_channels: int) -> list[int]:
