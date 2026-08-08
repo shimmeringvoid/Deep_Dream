@@ -21,12 +21,19 @@ of Fractal Studio (which is only one possible source of input frames).
   on `batch_size` boundaries. With it, `mixed9` (all 2048 channels) has been
   browsed in 15.8 min. See "Multi-GPU browsing" and "Decisions settled
   2026-08-08". Nothing has been eye-picked out of those sheets yet.
+* **Milestone 3 has a working bridge** (2026-08-08): `dream_video.py` in the
+  repo root dreams an existing video frame by frame with the coherence rule
+  under the identity warp, resumable numbered PNGs, house x264 assembly.
+  Verified on real weights (see "Video dreaming" below). It is deliberately a
+  script, not a package: `io/` and `coherence/` as proper modules, and a
+  `cli.py video` subcommand, are still to build.
 
       conda activate deepdream
       python cli.py layers                       # taps and channel counts
       python cli.py browse --layer mixed7        # contact sheets -> out/browse/
       python cli.py browse --layer mixed9 --gpus 4   # 2048 channels, four cards
       python cli.py dream photo.jpg --preset flowers
+      python dream_video.py clip.mp4 --preset flowers --max-dim 1920
       python -m pytest tests -q                  # 46 tests, ~11 s
 * The notebook is still the **reference implementation** for the *look*, and
   the place to play interactively. `engine/` is the same machinery, importable;
@@ -119,6 +126,18 @@ Built (milestone 2):
     cli.py               subcommands: layers | browse | dream | presets.
     tests/test_engine.py 46 tests; the slow ones need a GPU + weights, and one
                          is marked `multigpu`.
+
+Bridged by a script (milestone 3, 2026-08-08):
+
+    dream_video.py   repo root, not a package. Video -> dreamed video: reads
+                     frames with imageio-ffmpeg, seeds each frame from the
+                     last dreamed one (identity warp), writes absolute-indexed
+                     PNGs atomically so a killed run resumes, assembles with
+                     the house x264 settings. Chunked multi-GPU is manual —
+                     one process per card over --start/--duration into a
+                     shared --frames-dir, with --warmup hiding the seams.
+                     It calls the seams below and adds no new machinery, so
+                     io/ and coherence/ can absorb it without a rewrite.
 
 Still to build:
 
@@ -321,6 +340,54 @@ like eyes and faces live deeper. `mixed9`'s 2048 sheets now exist (2026-08-08,
 Browsed so far: `mixed7` (768) and `mixed9` (2048), both InceptionV3, both at
 browse defaults. No other layer or backbone has been sheeted.
 
+## Video dreaming — BRIDGED (`dream_video.py`) 2026-08-08
+
+    python dream_video.py clip.mp4 --preset flowers --start 60 --duration 5 \
+        --max-dim 1280                          # a review slice first
+    python dream_video.py clip.mp4 --preset flowers --max-dim 1920
+    python dream_video.py clip.mp4 --preset flowers --device cuda:1 \
+        --start 45 --duration 45 --warmup 1 --frames-dir D --no-assemble
+    python dream_video.py clip.mp4 --assemble-only --frames-dir D --out v.mp4
+
+Milestone 3's behaviour, in one script at the repo root, built only on
+`engine/` seams. `seed(t) = a*dream[t-1] + (1-a)*frame[t]` with the identity
+warp — right for footage that changes in place (a Julia parameter morph,
+ordinary video); fractal *zooms* want `image.zoom` as the warp, which is
+milestone 5 and not done here.
+
+Things worth knowing before using it:
+
+* **Video wants far fewer steps than stills.** Defaults are steps 24, octaves
+  `-1:0`, coherence 0.5 — feedback carries detail across frames, so each frame
+  only has to add a little. The first frame of a chain gets 3x steps to ramp
+  in. `--coherence` is the flicker/trails knob: 0 is independent frames and
+  visibly boils, higher is smoother and dreamier.
+* **Frames are absolute-indexed PNGs written atomically**, so a killed run
+  resumes by re-running the same command, and a resumed run reloads the last
+  frame on disk as its coherence seed rather than re-dreaming warmup.
+* **Chunked multi-GPU is manual and works today**: one process per card over
+  `--start`/`--duration` into a shared `--frames-dir` with `--no-assemble`,
+  `--warmup 1` on every chunk but the first so a chunk's first kept frame has
+  coherent history, then one `--assemble-only` pass. This is the scene-chunk
+  shard milestone 6 wants, done by hand — note it is *not* `engine/shard.py`'s
+  aligned-span planner, because frames in a coherent chain are sequential.
+* **New settings need a new `--frames-dir`.** Resume matches on frame index
+  alone; it cannot tell a frame dreamed at other settings from a current one.
+* `--max-dim` defaults to 1920 (`0` = native). Sides are forced even for x264.
+
+Verified 2026-08-08 on `julia_morph_z3_p_c.mp4` (3 min, 3840x2160 @ 30 fps),
+`flowers` preset, InceptionV3, one card (`cuda:1`): 2 s slice at 640 px /
+8 steps → 60 PNGs in 53 s wall (0.8 s/frame), assembled mp4 decodes to 60
+frames at 640x360 @ 30 fps and plays. The dream is present but light at that
+step count — a smoke test, not a look test.
+
+One real bug was found and fixed by that first run: `from engine import dream`
+gets the re-exported **function**, not the `engine.dream` submodule
+(`engine/__init__.py` binds the name), so the module-style call raised
+`AttributeError`. Even `import engine.dream as m` binds the function. Anything
+new should import `from engine.dream import dream_tensor`, the way `cli.py`
+and the tests already do.
+
 ## Model choice (still open for rafa — but now a flag away)
 
 **InceptionV3** (`IMAGENET1K_V1`, `transform_input=False`) stays the default.
@@ -359,9 +426,13 @@ which backbone it was picked on, and `cli.py dream` warns on a mismatch.
    presets are first-class, all 768 `mixed7` channels sheeted. Tests in
    `tests/`.
 3. Coherent 5-second dreamed clip (frame-to-frame seeding), arbitrary input —
-   **next up**. Embryo exists as `dream_zoom_video` in the notebook; the seam
-   to build on is `engine.dream.dream_tensor` + `engine.image.zoom`. Needs
-   `io/` (video↔frames) and `coherence/`.
+   **BRIDGED 2026-08-08, not yet packaged.** `dream_video.py` does it end to
+   end on real footage (see "Video dreaming" below); the coherence rule,
+   resume, and chunked multi-GPU rendering all work. What remains for the
+   milestone proper is structural: `io/` (video↔frames) and `coherence/` as
+   modules, and a `cli.py video` subcommand, so the script's behaviour stops
+   living in a script. The embryo it grew from is `dream_zoom_video` in the
+   notebook; the seams are `engine.dream.dream_tensor` + `engine.image.zoom`.
 4. Time-varying schedule (targets/strength morphing across the clip). The
    preset format is ready to be referenced by name from a schedule.
 5. Optional zoom-warp coherence using Fractal Studio's per-frame zoom sidecar.

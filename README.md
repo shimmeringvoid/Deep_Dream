@@ -27,12 +27,12 @@ These three ideas are the point of the project, not extras:
 | 1. Single-image dream (notebook: simple dream, octaves, tiled gradients) | **Done** |
 | 2. Weighted multi-target objective + contact-sheet channel browser (`engine/`, `cli.py`) | **Done** |
 | — Multi-GPU channel browsing (`--gpus`, bit-identical to single-GPU output) | **Done** |
-| 3. Coherent dreamed clips (frame-to-frame seeding, `io/` + `coherence/`) | Next up |
+| 3. Coherent dreamed clips (frame-to-frame seeding) — working as `dream_video.py`; `io/` + `coherence/` modules and a `cli.py video` subcommand still to come | **Bridged** |
 | 4. Time-varying schedules (`schedule/`, presets blended by name over time) | Planned |
 | 5. Zoom-warp coherence from per-frame metadata sidecars | Planned |
 | 6. Multi-GPU frame sharding | Planned |
 
-Milestones 1 and 2 are fully usable today: dream single images with arbitrary weighted targets, and browse a network layer channel-by-channel to build your own presets. An embryo of the video pipeline exists as `dream_zoom_video` in the notebook.
+Milestones 1 and 2 are fully usable today: dream single images with arbitrary weighted targets, and browse a network layer channel-by-channel to build your own presets. Video works too, via `dream_video.py` at the repo root — coherent frame-to-frame seeding, resumable frames, chunked rendering across cards — pending its promotion from a script into `io/` + `coherence/` modules behind a `cli.py video` subcommand.
 
 ## Quick start
 
@@ -43,6 +43,7 @@ conda activate deepdream
 python cli.py layers                    # what can I tap?
 python cli.py dream photo.jpg --preset flowers
 python cli.py browse --layer mixed7     # contact-sheet all 768 channels
+python dream_video.py clip.mp4 --preset flowers   # dream a video (see dream_video.py -h)
 python -m pytest tests -q               # sanity-check the install
 ```
 
