@@ -107,10 +107,18 @@ Design commitments (these are the point of the project, not extras):
   (each coherent run stays on one GPU), not by interleaved frame index.
   `engine/shard.py` already does exactly this for the channel browser
   (`--gpus 4`, ~3.3x); milestone 6 should copy its process/env/merge shape.
-* GPU 0 also hosts an unrelated long-lived Jupyter kernel (`inception` env,
-  ~4.7 GB, running since late July). Harmless at browse batch sizes (~1.7 GB
-  per worker) but it does make GPU 0 the slow shard — check before blaming the
-  code, and it is rafa's to kill, not Claude's.
+* GPU 0 is **clear as of 2026-08-08** — the long-lived `inception` Jupyter
+  kernel that used to sit on it (~4.7 GB, since late July) has been killed.
+  Its residual ~680 MB is the desktop: GPU 0 drives the display, so it still
+  runs a little slower than the other three and is the one to leave alone if
+  something interactive needs to stay responsive. Older notes below that blame
+  the Jupyter kernel for GPU 0's lag describe runs made before it was killed.
+* **`tmux` is not installed on monster.** Launch parallel work with
+  `nohup ... &` until it is. One trap when doing that from a single shell
+  line: `A=1 && cmd1 & cmd2 &` binds the variables only inside the *first*
+  background job, so later jobs see them empty and die instantly on a bad
+  path. Give each `nohup` its own braces and literal paths, then confirm with
+  `nvidia-smi` that every card is actually busy before walking away.
 
 ## Architecture
 
@@ -290,10 +298,11 @@ Verified 2026-08-08, at full browse defaults, tiles compared byte-for-byte:
   version of the check above).
 
 Scaling is sublinear-ish because the cards are not identical in load — GPU 0
-also hosts an unrelated long-lived Jupyter kernel (~4.7 GB), which is worth
-remembering before blaming the sharding for a slow shard: on the `mixed9` run
-the three clean cards finished 512 channels in 14.3 min and GPU 0 took
-15.7 min. Memory is not the constraint: a worker at batch 16 / 256 px sits at
+was, at the time of this run, also hosting an unrelated long-lived Jupyter
+kernel (~4.7 GB; killed 2026-08-08), which is worth remembering before blaming
+the sharding for a slow shard: on the `mixed9` run the three clean cards
+finished 512 channels in 14.3 min and GPU 0 took 15.7 min. GPU 0 still drives
+the display, so expect it to stay marginally the slowest. Memory is not the constraint: a worker at batch 16 / 256 px sits at
 ~1.7 GB, so batch could go a lot higher if wall-clock ever mattered more than
 matching an existing sheet's batch size.
 
@@ -540,10 +549,13 @@ Conclusions for milestone 6, which is where this matters:
   re-dreaming 540-809 to repair that produces a new 809 that breaks the
   previously seamless 809|810. The damage chases the fix down the timeline.
 
-**Non-code operational note:** run chunked renders in **tmux, one pane per
-card**. Backgrounded jobs launched together were silently serialized on this
-box — chunks 1-3 ran 04:36-05:27 and chunk 4 did not start until 06:08 — which
-turned a ~50 min four-way render into 2 h 23 min of wall-clock.
+**Non-code operational note:** launch chunked renders so they genuinely run at
+once — `nohup ... &`, one per card, since `tmux` is not installed here (see
+Hardware). Jobs handed to Claude's background runner one at a time were
+silently serialized on this box: chunks 1-3 ran 04:36-05:27 and chunk 4 did
+not start until 06:08, turning a ~50 min four-way render into 2 h 23 min of
+wall-clock. Always confirm with `nvidia-smi` that every card is busy before
+walking away.
 
 ## Model choice (still open for rafa — but now a flag away)
 
