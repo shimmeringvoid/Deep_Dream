@@ -378,10 +378,12 @@ Things worth knowing before using it:
   frame on disk as its coherence seed rather than re-dreaming warmup.
 * **Chunked multi-GPU is manual and works today**: one process per card over
   `--start`/`--duration` into a shared `--frames-dir` with `--no-assemble`,
-  `--warmup 1` on every chunk but the first so a chunk's first kept frame has
+  a warmup on every chunk but the first so a chunk's first kept frame has
   coherent history, then one `--assemble-only` pass. This is the scene-chunk
   shard milestone 6 wants, done by hand — note it is *not* `engine/shard.py`'s
   aligned-span planner, because frames in a coherent chain are sequential.
+  **`--warmup 1` is not enough at high coherence** and leaves visible seams —
+  see "Chunk seams" below before relying on this.
 * **New settings need a new `--frames-dir`.** Resume matches on frame index
   alone; it cannot tell a frame dreamed at other settings from a current one.
 * `--max-dim` defaults to 1920 (`0` = native). Sides are forced even for x264.
@@ -479,6 +481,70 @@ with an equals sign — `--octaves=-2:0`. Written as `--octaves -2:0` argparse
 reads the value as a flag and dies with "expected one argument". Applies to
 `cli.py` too, and it cost a slice re-run.
 
+### Chunk seams — what the first full render taught (2026-09-01)
+
+The first full `zoom_zsinz` render (1053 frames, 1920 px, `flowers_video`,
+coherence 0.85, `--octaves=-2:0`) was cut into four butt-joined chunks with
+`--warmup 1` on chunks 2-4, and **two of its three joins were visibly
+discontinuous**. Measured as frame-to-frame similarity at the join against the
+local baseline of ordinary neighbouring pairs:
+
+| join | at join | neighbours | verdict |
+|---|---|---|---|
+| 269\|270 | +0.954 | +0.9936 ± 0.0002 | seam |
+| 539\|540 | +0.722 | +0.967 ± 0.002 | seam |
+| 809\|810 | +0.966 | +0.966 ± 0.003 | invisible |
+
+By eye at the worst one: frame 539 is smooth floret/cauliflower texture, 540
+breaks into spiky thistle bursts. A visible pop, not a subtle one.
+
+**Rule out mis-seeking first, then believe the seam.** `dream_video` seeks
+with ffmpeg `-ss`, which is keyframe-approximate, and then *assumes* the first
+decoded frame is `round(eff_start * fps)`. If that assumption broke, a chunk's
+PNGs would sit under indices they don't correspond to and the damage would
+show up at the joins and nowhere else — indistinguishable from a seam at first
+glance. It is checkable: correlate dreamed frames against source frames at
+offsets −3…+3 and look for a sharp peak at 0. It was clean here, in all four
+chunks, so indexing is fine.
+
+**Why `--warmup 1` was not enough.** At coherence 0.85 the dream texture
+accumulates over *hundreds* of frames. Frame 269 carried 270 frames of
+history; frame 270 carried 30. They are at different stages of the same slow
+build-up. **Warmup must cover the zoom's centre-to-edge transit time** — how
+long a feature born at the centre takes to reach the edge, about
+`ln(scale ratio) / ln(f)` frames, which at f = 1.0136 is several seconds, not
+one. Warmup that is short relative to that transit is warmup that has not
+built the texture the previous chunk already has.
+
+**The seamless join was an accident worth copying.** Join 809|810 is perfect
+because chunk 4 started ~92 min late (the four jobs got serialized), by which
+time chunk 3 had already written frames 780-809 — so chunk 4's warmup frames
+**resume-loaded off disk** and frame 810 seeded from chunk 3's *real* frame
+809. Exact inheritance, zero cost, zero seam.
+
+Conclusions for milestone 6, which is where this matters:
+
+* **Exact inheritance is inherently sequential.** A chunk that inherits its
+  predecessor's real last frame cannot start until that frame exists. This is
+  the coherence×sharding caveat under Hardware, sharpened: it is not merely
+  that frames within a chain are sequential, it is that *the chain's boundary
+  condition is the predecessor's output*.
+* **So parallel chunking needs overlapping chunks and a crossfade**, not butt
+  joins: each chunk starts far enough before its kept span to rebuild the
+  texture, chunks overlap, and assembly blends across the overlap rather than
+  cutting. Ordinary warmup is the degenerate zero-overlap case, and it is
+  exactly what failed here.
+* **The exact fix for a seamed render is one sequential process** from the
+  first bad frame to the end, seeded through the resume-load path. Re-dreaming
+  spans in parallel does *not* work: a new frame 539 breaks 539|540, and
+  re-dreaming 540-809 to repair that produces a new 809 that breaks the
+  previously seamless 809|810. The damage chases the fix down the timeline.
+
+**Non-code operational note:** run chunked renders in **tmux, one pane per
+card**. Backgrounded jobs launched together were silently serialized on this
+box — chunks 1-3 ran 04:36-05:27 and chunk 4 did not start until 06:08 — which
+turned a ~50 min four-way render into 2 h 23 min of wall-clock.
+
 ## Model choice (still open for rafa — but now a flag away)
 
 **InceptionV3** (`IMAGENET1K_V1`, `transform_input=False`) stays the default.
@@ -535,7 +601,9 @@ which backbone it was picked on, and `cli.py dream` warns on a mismatch.
    caveat under Hardware. **Half-done early**: the channel browser already
    shards across all four cards (`engine/shard.py`, 2026-08-08); frames want
    the same process/env/merge shape with a scene-chunk planner instead of an
-   aligned-span one.
+   aligned-span one. **The naive version of that is now known to be wrong** —
+   butt-joined chunks leave visible seams. See "Chunk seams" below before
+   building it.
 
 ## Decisions settled 2026-08-07 (the engine/ + browser session)
 
