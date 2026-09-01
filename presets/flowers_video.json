@@ -1,0 +1,22 @@
+{
+  "name": "flowers_video",
+  "backbone": "inception_v3",
+  "notes": "flowers minus channel 12 (elongated bud/lozenge shapes on smooth regions in the video regime); rafa's pick from the zoom_zsinz A/B slices, 2026-09-01. Video-regime preset; pair with --zoom on zooms.",
+  "targets": [
+    {
+      "layer": "mixed7",
+      "channel": 634,
+      "weight": 1.0
+    },
+    {
+      "layer": "mixed7",
+      "channel": 602,
+      "weight": 0.7
+    },
+    {
+      "layer": "mixed7",
+      "channel": 292,
+      "weight": 0.5
+    }
+  ]
+}

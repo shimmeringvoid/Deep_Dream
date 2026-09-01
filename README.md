@@ -29,10 +29,10 @@ These three ideas are the point of the project, not extras:
 | — Multi-GPU channel browsing (`--gpus`, bit-identical to single-GPU output) | **Done** |
 | 3. Coherent dreamed clips (frame-to-frame seeding) — working as `dream_video.py`; `io/` + `coherence/` modules and a `cli.py video` subcommand still to come | **Bridged** |
 | 4. Time-varying schedules (`schedule/`, presets blended by name over time) | Planned |
-| 5. Zoom-warp coherence from per-frame metadata sidecars | Planned |
+| 5. Zoom-warp coherence — constant-rate zooms via `--zoom`; variable-rate from a metadata sidecar still to come | **First bite** |
 | 6. Multi-GPU frame sharding | Planned |
 
-Milestones 1 and 2 are fully usable today: dream single images with arbitrary weighted targets, and browse a network layer channel-by-channel to build your own presets. Video works too, via `dream_video.py` at the repo root — coherent frame-to-frame seeding, resumable frames, chunked rendering across cards — pending its promotion from a script into `io/` + `coherence/` modules behind a `cli.py video` subcommand.
+Milestones 1 and 2 are fully usable today: dream single images with arbitrary weighted targets, and browse a network layer channel-by-channel to build your own presets. Video works too, via `dream_video.py` at the repo root — coherent frame-to-frame seeding, resumable frames, chunked rendering across cards, and `--zoom` for fractal zooms — pending its promotion from a script into `io/` + `coherence/` modules behind a `cli.py video` subcommand.
 
 ## Quick start
 
@@ -44,6 +44,7 @@ python cli.py layers                    # what can I tap?
 python cli.py dream photo.jpg --preset flowers
 python cli.py browse --layer mixed7     # contact-sheet all 768 channels
 python dream_video.py clip.mp4 --preset flowers   # dream a video (see dream_video.py -h)
+python dream_video.py zoom.mp4 --preset flowers_video --zoom 1.013607   # a fractal zoom
 python -m pytest tests -q               # sanity-check the install
 ```
 
@@ -139,6 +140,22 @@ Practical notes from browsing InceptionV3 so far: `mixed7` (768 channels) eye-pi
 python cli.py presets
 ```
 
+## Video — `dream_video.py`
+
+Video lives in a script at the repo root, not yet in the CLI. It seeds each frame from the last dreamed one, so detail carries across frames instead of boiling: `seed(t) = a·dream[t-1] + (1-a)·frame[t]`. Frames are written as numbered PNGs, so a killed run resumes by re-running the same command, and chunks rendered on different cards into one `--frames-dir` assemble into a single video.
+
+```bash
+python dream_video.py clip.mp4 --preset flowers --start 60 --duration 5 --max-dim 1280
+python dream_video.py zoom.mp4 --preset flowers_video --zoom 1.013607 --coherence 0.65
+python dream_video.py clip.mp4 --assemble-only --frames-dir D --out out.mp4
+```
+
+Video wants far fewer steps than stills (defaults: 24 steps, octaves `-1:0`, coherence 0.5) because the feedback carries detail forward. `--coherence` is the flicker/trails knob.
+
+**`--zoom` is for footage that zooms.** On a fractal zoom the previous dream is a frame behind the picture, so blending it unwarped pins the dream to the screen while the image flows outward underneath — the dream stops being *in* the scene and becomes an overlay on it. `--zoom F` magnifies the previous dream about the frame centre by `F` before blending, so it rides along. `F` is the **per-source-frame** factor: footage magnifying `R` times per second at `fps` wants `F = R ** (1/fps)` — a 1.5×/s zoom at 30 fps is `1.5 ** (1/30)` = `1.013607`. This handles a constant rate about the frame centre; variable rates from a metadata sidecar are still to come.
+
+> **Gotcha:** a negative low octave must be written with an equals sign — `--octaves=-2:0`, not `--octaves -2:0`, which argparse reads as a flag and rejects. Same for `cli.py`.
+
 ## Targets
 
 A target is one term of the dream objective, written `layer[:channel[:weight]]`:
@@ -170,15 +187,18 @@ A preset is the durable output of a browsing session: named target lists as JSON
 
 `"channel": null` means the whole-layer mean. The `backbone` field is required because **channel numbers are not portable between backbones** — `cli.py dream` warns if a preset is used with a different backbone than it was picked on. `notes` is for provenance.
 
-Three presets ship with the repo, all eye-picked from the InceptionV3 `mixed7` sheets and verified by rendering:
+Four presets ship with the repo, all from the InceptionV3 `mixed7` sheets and verified by rendering:
 
 | Preset | Channels (weight) | Character |
 |---|---|---|
 | `flowers` | 634 (1.0), 12 (0.8), 602 (0.7), 292 (0.5) | dense florets, buds, pale blossoms, a spiky thistle for bite |
+| `flowers_video` | 634 (1.0), 602 (0.7), 292 (0.5) | `flowers` minus channel 12 — the video-regime cut (see below) |
 | `spirals` | 632 (1.0), 631 (0.8), 8 (0.7), 603 (0.5) | ornate scrollwork, concentric shells, loose vortices, wavy ribbons |
 | `scales` | 55 (1.0), 43 (0.8), 610 (0.7), 611 (0.6), 10 (0.5) | shingles, overlapping scales, scalloped rows — strong on flat regions |
 
 Weighted blends of 4–5 channels read much better on real footage than any single channel, which tends to be too uniform across a frame.
+
+`flowers_video` is the one preset picked in **motion** rather than off a contact sheet: channel 12's buds, harmless in a still, read as elongated lozenges strewn across smooth regions once the footage moves. Use it for video and keep `flowers` for stills — a reminder that a preset's character is judged in the regime it will be used in.
 
 ## Backbones
 

@@ -27,6 +27,11 @@ of Fractal Studio (which is only one possible source of input frames).
   Verified on real weights (see "Video dreaming" below). It is deliberately a
   script, not a package: `io/` and `coherence/` as proper modules, and a
   `cli.py video` subcommand, are still to build.
+* **Milestone 5 has its first bite** (2026-09-01): `--zoom` gives
+  `dream_video.py` the zoom warp for constant-rate footage, verified on
+  `zoom_zsinz.mp4` and approved by rafa off six A/B slices. `flowers_video` is
+  the preset those slices picked. See "Zoom-warp coherence" below. The sidecar
+  reader for variable-rate zooms is still pending.
 
       conda activate deepdream
       python cli.py layers                       # taps and channel counts
@@ -34,6 +39,7 @@ of Fractal Studio (which is only one possible source of input frames).
       python cli.py browse --layer mixed9 --gpus 4   # 2048 channels, four cards
       python cli.py dream photo.jpg --preset flowers
       python dream_video.py clip.mp4 --preset flowers --max-dim 1920
+      python dream_video.py zoom.mp4 --preset flowers_video --zoom 1.013607
       python -m pytest tests -q                  # 46 tests, ~11 s
 * The notebook is still the **reference implementation** for the *look*, and
   the place to play interactively. `engine/` is the same machinery, importable;
@@ -331,6 +337,11 @@ verified by rendering each on the labrador (`cli.py dream ... --preset X`):
   the natural partner for a flowers→spirals morph in milestone 4.
 * **scales** — 55 (roof shingles), 43 (overlapping scales), 610 (scalloped
   rows), 611 (fish scales), 10 (fan arcs). Strong on flat regions.
+* **flowers_video** (2026-09-01) — `flowers` minus channel 12. Same three
+  remaining channels at the same weights. Picked in *motion*, not off a sheet:
+  12's elongated buds read as lozenges strewn over smooth regions once the
+  footage moves. Still dreams well; use it for video, keep `flowers` for
+  stills.
 
 **Not found: eyes.** `mixed7` has eye-*ish* channels (274, 309) but nothing
 convincing. Expected — `mixed7` is a texture/part layer; whole-object features
@@ -350,10 +361,10 @@ browse defaults. No other layer or backbone has been sheeted.
     python dream_video.py clip.mp4 --assemble-only --frames-dir D --out v.mp4
 
 Milestone 3's behaviour, in one script at the repo root, built only on
-`engine/` seams. `seed(t) = a*dream[t-1] + (1-a)*frame[t]` with the identity
-warp — right for footage that changes in place (a Julia parameter morph,
-ordinary video); fractal *zooms* want `image.zoom` as the warp, which is
-milestone 5 and not done here.
+`engine/` seams. `seed(t) = a*dream[t-1] + (1-a)*frame[t]`, identity warp by
+default — right for footage that changes in place (a Julia parameter morph,
+ordinary video). Fractal *zooms* want `image.zoom` as the warp, which is now
+`--zoom` (see "Zoom-warp coherence" below).
 
 Things worth knowing before using it:
 
@@ -387,6 +398,86 @@ gets the re-exported **function**, not the `engine.dream` submodule
 `AttributeError`. Even `import engine.dream as m` binds the function. Anything
 new should import `from engine.dream import dream_tensor`, the way `cli.py`
 and the tests already do.
+
+## Zoom-warp coherence — `--zoom` (milestone 5, first bite) 2026-09-01
+
+    # a clip magnifying 1.5x per second at 30 fps:
+    python dream_video.py zoom.mp4 --preset flowers_video --zoom 1.013607
+
+On a zoom, the previous dream is a frame *behind* the footage: its features
+belong to where they were, not where the fractal has since carried them.
+Blending it unwarped nails the dream to the screen while the picture flows
+outward underneath — which reads, as rafa put it, as **static flowers under a
+translucent colour overlay**. `--zoom F` supplies the missing warp, one line
+before the coherence blend:
+
+    prev = engine_image.zoom(prev, args.zoom ** args.every)
+
+`F` is the **per-SOURCE-frame** factor, so a clip zooming `R` times per second
+at `fps` wants `F = R ** (1/fps)`; `** args.every` because chained frames are
+`every` source frames apart. `image.zoom` scales about the frame centre, so
+this models a centred zoom only — check that assumption before trusting it on
+new footage (the measurement below is how).
+
+Verified 2026-08-10 on `zoom_zsinz.mp4`:
+
+* **Probe.** 2560x1440 (**landscape** — imageio's `meta['size']` is (W, H) and
+  reads misleadingly), 30.0 fps, 1053 frames = 35.1 s. The **palette cycles**,
+  ~45-50°/s of hue rotation (a full turn every ~7-8 s), measured by
+  zoom-aligning an early frame onto later ones and watching hue rotate while
+  structure stayed put. At a fixed point in a Mandelbrot zoom the iteration
+  count is fixed, so that is an animated LUT, not new content — dream features
+  carried forward keep their old colours while the footage recolours under
+  them.
+* **Rate verified, not assumed.** Sweeping the warp factor and scoring against
+  the frame one second later gives a sharp peak at **1.500x/s** (gray NCC
+  +0.975, sobel +0.840; ±0.05 falls to ~+0.37). A joint search over factor
+  *and* zoom centre put the centre at pixel (1280, 720) — the frame centre,
+  which is what makes `image.zoom` the right warp. Zoom-*out* scores −0.08
+  against zoom-in's +0.84, so features grow. An independent 0.2 s interval
+  gives 1.0840 vs 1.0845 predicted (implied 1.4967x/s).
+* **Per-frame factor: `1.5 ** (1/30)` = 1.013607.**
+* **The warp works, measurably.** The discriminating metric is temporal, not
+  spatial: score consecutive dreamed frames as *ride* = NCC(zoom(dream_t, F),
+  dream_t+1) against *stick* = NCC(dream_t, dream_t+1). Warped slices ride
+  (**+0.152**); identity-warp slices actually *stick* (**−0.004**), the smear
+  in numbers. Warped runs are also the smoothest overall (frame-to-frame NCC
+  0.962 vs 0.911) and the most faithful to the footage (0.896 vs 0.848).
+  A first attempt to measure single-frame radial anisotropy came out flat
+  across all six slices and proved nothing — worth remembering that this
+  artifact only shows up across time.
+* **No centre under-dreaming.** The worry that pixels at the centre are
+  perpetually youngest, and so under-dreamed, does not show: |dream − source|
+  by radial band is flat, outer/centre 1.02x warped, 1.04x warped at
+  coherence 0.65.
+* **Cost:** 3.1-4.1 s/frame at 1280 px on a Titan X, `cuda:0` slowest (it
+  drives the display). The warp itself is free — a resize and a crop.
+
+### Verdicts from the A/B slices (rafa, 2026-09-01)
+
+Six 5 s slices at 1280 px off `zoom_zsinz.mp4` (t=10-15 s) decided the knobs:
+
+* **Warp: approved**, and it is the difference between "static flowers under a
+  colour overlay" and the intended ride-the-zoom effect. Use `--zoom` on any
+  zoom.
+* **Coherence 0.65 over 0.5**, slightly. With the warp absorbing the smear
+  penalty, higher coherence buys density rather than instability.
+* **Channel 12 out** — its elongated bud/lozenge shapes colonize smooth
+  regions distractingly in motion. That is `presets/flowers_video.json`.
+  Dropping it thins them but does not eliminate them; 602/292 plus the
+  coherence feedback also make lozenge-ish forms.
+* **rafa wants the dream MORE pronounced, and losing the fractal is
+  acceptable.** That is the aesthetic direction, not a bug to be fixed.
+
+Next knobs to turn, in that direction: push **coherence toward 0.8-0.9** (the
+warp is what makes that viable at all — unwarped it would smear catastrophically),
+and try **`--octaves=-2:0`** for flowers-within-flowers, which puts large-scale
+bloom into the flat colour fields that the default `-1:0` leaves plain.
+
+**argparse gotcha, worth remembering:** a negative low octave must be written
+with an equals sign — `--octaves=-2:0`. Written as `--octaves -2:0` argparse
+reads the value as a flag and dies with "expected one argument". Applies to
+`cli.py` too, and it cost a slice re-run.
 
 ## Model choice (still open for rafa — but now a flag away)
 
@@ -435,7 +526,11 @@ which backbone it was picked on, and `cli.py dream` warns on a mismatch.
    notebook; the seams are `engine.dream.dream_tensor` + `engine.image.zoom`.
 4. Time-varying schedule (targets/strength morphing across the clip). The
    preset format is ready to be referenced by name from a schedule.
-5. Optional zoom-warp coherence using Fractal Studio's per-frame zoom sidecar.
+5. Zoom-warp coherence — **FIRST BITE DONE 2026-09-01** (verified 2026-08-10):
+   the constant-rate case is `--zoom` in `dream_video.py`. Reading a
+   *variable* rate from Fractal Studio's per-frame sidecar is still pending,
+   as is a zoom about a point other than the frame centre. See "Zoom-warp
+   coherence" below.
 6. Multi-GPU frame sharding on the workstation — see the coherence×sharding
    caveat under Hardware. **Half-done early**: the channel browser already
    shards across all four cards (`engine/shard.py`, 2026-08-08); frames want

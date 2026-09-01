@@ -7,14 +7,24 @@ Implements the coherence rule from CLAUDE.md with the identity warp:
     seed(t) = a * dream[t-1] + (1 - a) * frame[t]
 
 which is the right default for footage whose frame-to-frame change happens
-in place (a Julia parameter morph, ordinary footage). Fractal *zooms* will
-eventually want `image.zoom` as the warp (milestone 5); this script doesn't
-do that yet.
+in place (a Julia parameter morph, ordinary footage).
+
+For fractal *zooms* the previous dream is a frame behind the footage, and
+blending it unwarped smears dream features radially outward. `--zoom F`
+supplies the warp: the previous dream is magnified about centre by F (the
+footage's per-SOURCE-frame zoom factor) before it seeds the current frame.
+A clip zooming R times per second at `fps` wants `F = R ** (1/fps)`. This is
+milestone 5's constant-rate case; reading a variable rate from a Fractal
+Studio sidecar is still to come, as is a non-centred zoom (`image.zoom`
+scales about the frame centre, so check that is where the clip zooms into).
 
     conda activate deepdream
 
     # 5-second test slice, 1280 px wide, flowers preset:
     python dream_video.py julia.mp4 --preset flowers --start 60 --duration 5 --max-dim 1280
+
+    # a fractal zoom at 1.5x per second, 30 fps -> 1.5**(1/30):
+    python dream_video.py zoom.mp4 --preset flowers --zoom 1.013607
 
     # full-length render on one card:
     python dream_video.py julia.mp4 --preset flowers --max-dim 1920
@@ -105,6 +115,9 @@ def build_parser() -> argparse.ArgumentParser:
                          "discarded, so a chunk's first kept frame already has "
                          "coherent history (use ~1 on chunked runs)")
 
+    ap.add_argument("--zoom", type=float, default=1.0,
+                    help="per-SOURCE-frame zoom-in factor of the footage; the "
+                         "previous dream is warped to match before blending.")
     ap.add_argument("--coherence", type=float, default=0.5,
                     help="a in seed = a*dream[t-1] + (1-a)*frame[t]. "
                          "0 = independent frames (flickery), higher = smoother "
@@ -114,7 +127,9 @@ def build_parser() -> argparse.ArgumentParser:
                          "detail forward, so video wants far fewer than stills)")
     ap.add_argument("--step-size", type=float, default=0.01)
     ap.add_argument("--octaves", type=_octave_range, default=[-1, 0],
-                    help="lo:hi inclusive (default -1:0 — small for video)")
+                    help="lo:hi inclusive (default -1:0 — small for video). A "
+                         "negative low octave needs an equals sign: "
+                         "--octaves=-2:0, else argparse reads it as a flag.")
     ap.add_argument("--tile-size", type=int, default=512)
 
     ap.add_argument("--crf", type=int, default=20)
@@ -233,7 +248,9 @@ def main(argv=None) -> None:
         if work_hw is None:
             work_hw = _work_size(frame.shape[0], frame.shape[1], args.max_dim)
             print(f"dreaming at {work_hw[1]}x{work_hw[0]}, steps {args.steps} x "
-                  f"octaves {args.octaves}, coherence {args.coherence:g}")
+                  f"octaves {args.octaves}, coherence {args.coherence:g}"
+                  + (f", zoom warp {args.zoom:.6g}/frame" if args.zoom != 1.0
+                     else ""))
 
         fpath = frames_dir / f"{abs_idx:08d}.png"
         if fpath.exists() and not args.fresh:
@@ -248,6 +265,12 @@ def main(argv=None) -> None:
         # already-preprocessed image — so do the [-1, 1] mapping explicitly.
         t = engine_image.resize(frame[..., :3], work_hw, backbone.device)
         t = (t / 127.5 - 1.0).clamp(-1.0, 1.0)
+        # Milestone 5, constant-rate case: the previous dream is one source
+        # frame (or `every` of them) behind the footage, so magnify it to where
+        # its features have travelled before it seeds this frame. Without this
+        # the dream lags the zoom and smears radially outward.
+        if prev is not None and args.zoom != 1.0:
+            prev = engine_image.zoom(prev, args.zoom ** args.every)
         if prev is not None and args.coherence > 0:
             t = (args.coherence * prev + (1.0 - args.coherence) * t).clamp(-1.0, 1.0)
             steps = args.steps
